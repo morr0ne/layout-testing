@@ -1,0 +1,12 @@
+[package]
+name = "layout-testing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30"
+wgpu = "27.0"
+pollster = "0.4"
+bytemuck = "1.14"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+tracing = "0.1.41"
