@@ -1,34 +1,53 @@
-use crate::layouts::{LayoutWindow, Viewport};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use winit::window::Window;
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexturedVertex {
+    position: [f32; 2],
+    tex_coords: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ColoredVertex {
     position: [f32; 2],
     color: [f32; 3],
 }
 
-pub struct WgpuState<'window> {
-    surface: wgpu::Surface<'window>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    pub size: winit::dpi::PhysicalSize<u32>,
-    render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    index_count_to_render: u32,
-    vertex_buffer_capacity: wgpu::BufferAddress,
-    index_buffer_capacity: wgpu::BufferAddress,
-    // Rendering configuration
-    border_width_pixels: f32,
-    border_gap_extension_pixels: f32,
+pub struct LayoutWindow {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub texture_id: u32,
+    pub is_focused: bool,
 }
 
-impl<'window> WgpuState<'window> {
-    pub async fn new(window: Arc<Window>) -> Result<WgpuState<'window>> {
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    textured_pipeline: wgpu::RenderPipeline,
+    colored_pipeline: wgpu::RenderPipeline,
+    textures: HashMap<u32, WindowTexture>,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    viewport_width: f32,
+    viewport_height: f32,
+}
+
+struct WindowTexture {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+impl Renderer {
+    pub async fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -47,11 +66,11 @@ impl<'window> WgpuState<'window> {
                 force_fallback_adapter: false,
             })
             .await
-            .context("Failed to find suitable GPU adapter")?;
+            .context("Failed to find adapter")?;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: None,
+                label: Some("Device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
@@ -59,24 +78,15 @@ impl<'window> WgpuState<'window> {
                 experimental_features: Default::default(),
             })
             .await
-            .context("Failed to request GPU device")?;
+            .context("Failed to create device")?;
 
         let surface_caps = surface.get_capabilities(&adapter);
-
-        // Choose surface format - prefer sRGB for correct color display
         let surface_format = surface_caps
             .formats
             .iter()
             .find(|f| f.is_srgb())
             .copied()
-            .or_else(|| surface_caps.formats.first().copied())
-            .context("No supported surface formats available")?;
-
-        let alpha_mode = surface_caps
-            .alpha_modes
-            .first()
-            .copied()
-            .context("No supported alpha modes available")?;
+            .unwrap_or(surface_caps.formats[0]);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -84,143 +94,154 @@ impl<'window> WgpuState<'window> {
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode,
+            alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-
         surface.configure(&device, &config);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                r#"
-struct VertexInput {
-    @location(0) position: vec2<f32>,
-    @location(1) color: vec3<f32>,
-}
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec3<f32>,
-}
-
-@vertex
-fn vs_main(model: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(model.position, 0.0, 1.0);
-    out.color = model.color;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
-}
-"#
-                .into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "shaders/windows.wgsl"
+            ))),
         });
 
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Pipeline Layout"),
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let textured_pipeline =
+            Self::create_textured_pipeline(&device, &shader, &bind_group_layout, surface_format);
+        let colored_pipeline = Self::create_colored_pipeline(&device, &shader, surface_format);
+
+        Ok(Self {
+            device,
+            queue,
+            surface,
+            config,
+            size,
+            textured_pipeline,
+            colored_pipeline,
+            textures: HashMap::new(),
+            bind_group_layout,
+            sampler,
+            viewport_width: size.width as f32,
+            viewport_height: size.height as f32,
+        })
+    }
+
+    fn create_textured_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Textured Pipeline Layout"),
+            bind_group_layouts: &[bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Textured Pipeline"),
+            layout: Some(&layout),
             vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
+                module: shader,
+                entry_point: Some("vs_textured"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                    array_stride: std::mem::size_of::<TexturedVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            offset: 0,
-                            shader_location: 0,
-                            format: wgpu::VertexFormat::Float32x2,
-                        },
-                        wgpu::VertexAttribute {
-                            offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                            shader_location: 1,
-                            format: wgpu::VertexFormat::Float32x3,
-                        },
-                    ],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
                 }],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
+                module: shader,
+                entry_point: Some("fs_textured"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
+                    format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
+            multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
+        })
+    }
+
+    fn create_colored_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::RenderPipeline {
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Colored Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
         });
 
-        // Initial buffer sizes - calculated to handle a reasonable number of windows
-        // Each window requires 4 vertices (quad) + potentially 16 more for borders (4 quads)
-        // = 20 vertices max per window. 100 windows = 2000 vertices comfortably.
-        const INITIAL_VERTEX_COUNT: usize = 2048;
-        const INITIAL_INDEX_COUNT: usize = INITIAL_VERTEX_COUNT * 2; // Approximately 1.5x vertices in practice
-
-        let vertex_buffer_capacity =
-            (INITIAL_VERTEX_COUNT * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-        let index_buffer_capacity =
-            (INITIAL_INDEX_COUNT * std::mem::size_of::<u16>()) as wgpu::BufferAddress;
-
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Vertex Buffer"),
-            size: vertex_buffer_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Index Buffer"),
-            size: index_buffer_capacity,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            index_count_to_render: 0,
-            vertex_buffer_capacity,
-            index_buffer_capacity,
-            border_width_pixels: 4.0,
-            border_gap_extension_pixels: 10.0,
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Colored Pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_colored"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ColoredVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x3],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_colored"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
         })
     }
 
@@ -230,216 +251,124 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.viewport_width = new_size.width as f32;
+            self.viewport_height = new_size.height as f32;
         }
     }
 
-    pub fn render_windows(&mut self, windows: &[LayoutWindow], viewport: Viewport) {
-        // Pre-allocate with capacity hint for better performance
-        // Each window = 4 vertices, potentially 16 more for borders
-        let estimated_vertex_count = windows.len() * 20;
-        let estimated_index_count = estimated_vertex_count * 2;
+    pub fn load_texture(&mut self, path: &str, texture_id: u32) -> Result<()> {
+        let img = image::open(path)?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
 
-        let mut vertices = Vec::with_capacity(estimated_vertex_count);
-        let mut indices = Vec::with_capacity(estimated_index_count);
-        let mut next_vertex_index = 0u16;
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
 
-        for window in windows.iter() {
-            // Window coordinates are already viewport-relative from get_visible_windows()
-            // Convert directly to NDC (Normalized Device Coordinates: -1.0 to 1.0)
-            let ndc_left = (window.rect.x / viewport.width) * 2.0 - 1.0;
-            let ndc_top = -((window.rect.y / viewport.height) * 2.0 - 1.0);
-            let ndc_right = ((window.rect.x + window.rect.width) / viewport.width) * 2.0 - 1.0;
-            let ndc_bottom =
-                -(((window.rect.y + window.rect.height) / viewport.height) * 2.0 - 1.0);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("Texture {}", texture_id)),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
 
-            let window_color = self.compute_window_color(window.id, window.workspace_id);
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
 
-            // Draw main window rectangle as 2 triangles (quad)
-            let quad_base_index = next_vertex_index;
-            vertices.extend_from_slice(&[
-                Vertex {
-                    position: [ndc_left, ndc_top],
-                    color: window_color,
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("Bind Group {}", texture_id)),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
                 },
-                Vertex {
-                    position: [ndc_right, ndc_top],
-                    color: window_color,
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
-                Vertex {
-                    position: [ndc_right, ndc_bottom],
-                    color: window_color,
+            ],
+        });
+
+        self.textures.insert(
+            texture_id,
+            WindowTexture {
+                _texture: texture,
+                bind_group,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn render(&mut self, windows: &[LayoutWindow]) -> Result<(), wgpu::SurfaceError> {
+        let mut textured_vertices = Vec::new();
+        let mut textured_indices = Vec::new();
+        let mut colored_vertices = Vec::new();
+        let mut colored_indices = Vec::new();
+
+        // Build geometry
+        for window in windows {
+            let (left, top, right, bottom) =
+                self.to_ndc(window.x, window.y, window.width, window.height);
+
+            // Add window quad
+            let base = textured_vertices.len() as u16;
+            textured_vertices.extend_from_slice(&[
+                TexturedVertex {
+                    position: [left, top],
+                    tex_coords: [0.0, 0.0],
                 },
-                Vertex {
-                    position: [ndc_left, ndc_bottom],
-                    color: window_color,
+                TexturedVertex {
+                    position: [right, top],
+                    tex_coords: [1.0, 0.0],
+                },
+                TexturedVertex {
+                    position: [right, bottom],
+                    tex_coords: [1.0, 1.0],
+                },
+                TexturedVertex {
+                    position: [left, bottom],
+                    tex_coords: [0.0, 1.0],
                 },
             ]);
-            indices.extend_from_slice(&[
-                quad_base_index,
-                quad_base_index + 1,
-                quad_base_index + 2,
-                quad_base_index,
-                quad_base_index + 2,
-                quad_base_index + 3,
+            textured_indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base,
+                base + 2,
+                base + 3,
             ]);
-            next_vertex_index += 4;
 
-            // Draw border if focused
+            // Add border if focused
             if window.is_focused {
-                next_vertex_index = self.render_border(
-                    ndc_left,
-                    ndc_top,
-                    ndc_right,
-                    ndc_bottom,
-                    viewport,
-                    &mut vertices,
-                    &mut indices,
-                    next_vertex_index,
+                self.add_border(
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    &mut colored_vertices,
+                    &mut colored_indices,
                 );
             }
         }
 
-        if !vertices.is_empty() {
-            let vertex_data = bytemuck::cast_slice(&vertices);
-            let index_data = bytemuck::cast_slice(&indices);
-
-            // Check if we need to resize buffers (they grew beyond capacity)
-            if vertex_data.len() as wgpu::BufferAddress > self.vertex_buffer_capacity {
-                let new_capacity = (vertex_data.len() as wgpu::BufferAddress).next_power_of_two();
-                self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Vertex Buffer (Resized)"),
-                    size: new_capacity,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.vertex_buffer_capacity = new_capacity;
-                tracing::warn!(
-                    "Vertex buffer resized to {} bytes ({} vertices)",
-                    new_capacity,
-                    new_capacity / std::mem::size_of::<Vertex>() as u64
-                );
-            }
-
-            if index_data.len() as wgpu::BufferAddress > self.index_buffer_capacity {
-                let new_capacity = (index_data.len() as wgpu::BufferAddress).next_power_of_two();
-                self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Index Buffer (Resized)"),
-                    size: new_capacity,
-                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.index_buffer_capacity = new_capacity;
-                tracing::warn!(
-                    "Index buffer resized to {} bytes ({} indices)",
-                    new_capacity,
-                    new_capacity / std::mem::size_of::<u16>() as u64
-                );
-            }
-
-            // Write buffer data - write_buffer is the recommended approach for dynamic updates
-            self.queue.write_buffer(&self.vertex_buffer, 0, vertex_data);
-            self.queue.write_buffer(&self.index_buffer, 0, index_data);
-            self.index_count_to_render = indices.len() as u32;
-        } else {
-            self.index_count_to_render = 0;
-        }
-    }
-
-    fn compute_window_color(&self, window_id: u32, workspace_id: usize) -> [f32; 3] {
-        let hue = ((window_id as f32 * 0.618) + (workspace_id as f32 * 0.1)) % 1.0;
-        hsv_to_rgb(hue, 0.6, 0.9)
-    }
-
-    /// Renders a border around a window by adding 4 rectangular strips (top, bottom, left, right)
-    /// The border extends into the gaps between windows for visual continuity
-    /// Returns the updated next_vertex_index
-    fn render_border(
-        &self,
-        ndc_left: f32,
-        ndc_top: f32,
-        ndc_right: f32,
-        ndc_bottom: f32,
-        viewport: Viewport,
-        vertices: &mut Vec<Vertex>,
-        indices: &mut Vec<u16>,
-        mut next_vertex_index: u16,
-    ) -> u16 {
-        // Convert pixel measurements to NDC space
-        let border_width_ndc_horizontal = (self.border_width_pixels / viewport.width) * 2.0;
-        let border_width_ndc_vertical = (self.border_width_pixels / viewport.height) * 2.0;
-        let gap_extension_ndc_horizontal =
-            (self.border_gap_extension_pixels / viewport.width) * 2.0;
-        let gap_extension_ndc_vertical = (self.border_gap_extension_pixels / viewport.height) * 2.0;
-
-        // Outer edge of border (extends into gaps)
-        let border_outer_left = ndc_left - gap_extension_ndc_horizontal;
-        let border_outer_top = ndc_top + gap_extension_ndc_vertical;
-        let border_outer_right = ndc_right + gap_extension_ndc_horizontal;
-        let border_outer_bottom = ndc_bottom - gap_extension_ndc_vertical;
-
-        // Inner edge of border (at window boundary minus border width)
-        let border_inner_left = border_outer_left + border_width_ndc_horizontal;
-        let border_inner_top = border_outer_top - border_width_ndc_vertical;
-        let border_inner_right = border_outer_right - border_width_ndc_horizontal;
-        let border_inner_bottom = border_outer_bottom + border_width_ndc_vertical;
-
-        let border_color = [1.0, 1.0, 1.0]; // White border
-
-        // Each border edge is a quad defined by 4 corners (outer and inner edges)
-        let border_edge_quads = [
-            // Top border strip
-            [
-                [border_outer_left, border_outer_top],
-                [border_outer_right, border_outer_top],
-                [border_inner_right, border_inner_top],
-                [border_inner_left, border_inner_top],
-            ],
-            // Bottom border strip
-            [
-                [border_inner_left, border_inner_bottom],
-                [border_inner_right, border_inner_bottom],
-                [border_outer_right, border_outer_bottom],
-                [border_outer_left, border_outer_bottom],
-            ],
-            // Left border strip
-            [
-                [border_outer_left, border_outer_top],
-                [border_inner_left, border_inner_top],
-                [border_inner_left, border_inner_bottom],
-                [border_outer_left, border_outer_bottom],
-            ],
-            // Right border strip
-            [
-                [border_inner_right, border_inner_top],
-                [border_outer_right, border_outer_top],
-                [border_outer_right, border_outer_bottom],
-                [border_inner_right, border_inner_bottom],
-            ],
-        ];
-
-        for quad_corners in &border_edge_quads {
-            let quad_base_index = next_vertex_index;
-            for &corner_position in quad_corners {
-                vertices.push(Vertex {
-                    position: corner_position,
-                    color: border_color,
-                });
-            }
-            indices.extend_from_slice(&[
-                quad_base_index,
-                quad_base_index + 1,
-                quad_base_index + 2,
-                quad_base_index,
-                quad_base_index + 2,
-                quad_base_index + 3,
-            ]);
-            next_vertex_index += 4;
-        }
-
-        next_vertex_index
-    }
-
-    pub fn present(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Render
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -452,7 +381,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             });
 
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -473,12 +402,75 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 timestamp_writes: None,
             });
 
-            if self.index_count_to_render > 0 {
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                render_pass.draw_indexed(0..self.index_count_to_render, 0, 0..1);
+            // Draw windows
+            if !textured_indices.is_empty() {
+                let textured_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Textured Vertex Buffer"),
+                    size: (textured_vertices.len() * std::mem::size_of::<TexturedVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(
+                    &textured_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&textured_vertices),
+                );
+
+                let textured_index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Textured Index Buffer"),
+                    size: (textured_indices.len() * std::mem::size_of::<u16>()) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(
+                    &textured_index_buffer,
+                    0,
+                    bytemuck::cast_slice(&textured_indices),
+                );
+
+                pass.set_pipeline(&self.textured_pipeline);
+                pass.set_vertex_buffer(0, textured_vertex_buffer.slice(..));
+                pass.set_index_buffer(textured_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+
+                for (i, window) in windows.iter().enumerate() {
+                    if let Some(texture) = self.textures.get(&window.texture_id) {
+                        pass.set_bind_group(0, &texture.bind_group, &[]);
+                        let start = (i * 6) as u32;
+                        pass.draw_indexed(start..start + 6, 0, 0..1);
+                    }
+                }
+            }
+
+            // Draw borders
+            if !colored_indices.is_empty() {
+                let colored_vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Colored Vertex Buffer"),
+                    size: (colored_vertices.len() * std::mem::size_of::<ColoredVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(
+                    &colored_vertex_buffer,
+                    0,
+                    bytemuck::cast_slice(&colored_vertices),
+                );
+
+                let colored_index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Colored Index Buffer"),
+                    size: (colored_indices.len() * std::mem::size_of::<u16>()) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(
+                    &colored_index_buffer,
+                    0,
+                    bytemuck::cast_slice(&colored_indices),
+                );
+
+                pass.set_pipeline(&self.colored_pipeline);
+                pass.set_vertex_buffer(0, colored_vertex_buffer.slice(..));
+                pass.set_index_buffer(colored_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..colored_indices.len() as u32, 0, 0..1);
             }
         }
 
@@ -487,21 +479,59 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         Ok(())
     }
-}
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let c = v * s;
-    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
-    let m = v - c;
+    fn to_ndc(&self, x: f32, y: f32, width: f32, height: f32) -> (f32, f32, f32, f32) {
+        let left = (x / self.viewport_width) * 2.0 - 1.0;
+        let top = -((y / self.viewport_height) * 2.0 - 1.0);
+        let right = ((x + width) / self.viewport_width) * 2.0 - 1.0;
+        let bottom = -(((y + height) / self.viewport_height) * 2.0 - 1.0);
+        (left, top, right, bottom)
+    }
 
-    let (r, g, b) = match (h * 6.0) as i32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
+    fn add_border(
+        &self,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        vertices: &mut Vec<ColoredVertex>,
+        indices: &mut Vec<u16>,
+    ) {
+        let border_width = 4.0;
+        let gap_ext = 10.0;
 
-    [r + m, g + m, b + m]
+        // Convert to NDC
+        let bw_h = (border_width / self.viewport_width) * 2.0;
+        let bw_v = (border_width / self.viewport_height) * 2.0;
+        let ge_h = (gap_ext / self.viewport_width) * 2.0;
+        let ge_v = (gap_ext / self.viewport_height) * 2.0;
+
+        let ol = left - ge_h;
+        let ot = top + ge_v;
+        let or = right + ge_h;
+        let ob = bottom - ge_v;
+        let il = ol + bw_h;
+        let it = ot - bw_v;
+        let ir = or - bw_h;
+        let ib = ob + bw_v;
+
+        let color = [1.0, 1.0, 1.0];
+
+        // 4 border quads: top, bottom, left, right
+        for corners in [
+            [[ol, ot], [or, ot], [ir, it], [il, it]], // Top
+            [[il, ib], [ir, ib], [or, ob], [ol, ob]], // Bottom
+            [[ol, ot], [il, it], [il, ib], [ol, ob]], // Left
+            [[ir, it], [or, ot], [or, ob], [ir, ib]], // Right
+        ] {
+            let base = vertices.len() as u16;
+            for pos in corners {
+                vertices.push(ColoredVertex {
+                    position: pos,
+                    color,
+                });
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
 }

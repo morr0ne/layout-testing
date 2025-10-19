@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info};
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -10,123 +9,117 @@ use winit::{
     window::{Window, WindowId},
 };
 
-mod layouts;
+mod layout;
 mod renderer;
 
-use layouts::{LayoutEngine, ScrollableLayout};
-use renderer::WgpuState;
+use layout::Layout;
+use renderer::Renderer;
 
-/*
+const NUM_TEXTURES: u32 = 4;
 
-This is basically the compositor but in this case it's a winit app. Obv this needs to be integrated in verdi as separate bits
-
-*/
-
-struct App<'window> {
+struct App {
     window: Option<Arc<Window>>,
-    renderer_state: Option<WgpuState<'window>>,
-    layout_engine: Box<dyn LayoutEngine>,
-    last_frame_time: Instant,
-    next_window_id_counter: u32,
+    renderer: Option<Renderer>,
+    layout: Option<Layout>,
+    last_frame: Instant,
+    next_window_id: u32,
 }
 
-impl<'window> Default for App<'window> {
+impl Default for App {
     fn default() -> Self {
         Self {
             window: None,
-            renderer_state: None,
-            layout_engine: Box::new(ScrollableLayout::new(1920.0, 1080.0)),
-            last_frame_time: Instant::now(),
-            next_window_id_counter: 0,
+            renderer: None,
+            layout: None,
+            last_frame: Instant::now(),
+            next_window_id: 0,
         }
     }
 }
 
-impl<'window> App<'window> {
-    fn init_window_and_renderer(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-    ) -> Result<(Arc<Window>, WgpuState<'window>)> {
-        let window_attributes = Window::default_attributes()
-            .with_title("Niri Layout - Arrows: Scroll | W: Add Window | [/]: Resize | Q: Remove");
-        let window = Arc::new(
-            event_loop
-                .create_window(window_attributes)
-                .context("Failed to create window")?,
-        );
+impl App {
+    fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let window =
+            Arc::new(
+                event_loop.create_window(Window::default_attributes().with_title(
+                    "Niri Layout - Arrows: Navigate | W: Add | [/]: Resize | Q: Remove",
+                ))?,
+            );
 
-        let window_size = window.inner_size();
-        self.layout_engine
-            .resize_viewport(window_size.width as f32, window_size.height as f32);
+        let size = window.inner_size();
+        let mut renderer = pollster::block_on(Renderer::new(window.clone()))?;
+        let layout = Layout::new(size.width as f32, size.height as f32);
 
-        let renderer_state = pollster::block_on(WgpuState::new(window.clone()))?;
+        // Load textures
+        for i in 0..NUM_TEXTURES {
+            renderer.load_texture(&format!("windows/{}.jpg", i), i)?;
+        }
 
-        Ok((window, renderer_state))
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.layout = Some(layout);
+
+        Ok(())
     }
 }
 
-impl<'window> ApplicationHandler for App<'window> {
+impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            match self.init_window_and_renderer(event_loop) {
-                Ok((window, renderer_state)) => {
-                    self.window = Some(window);
-                    self.renderer_state = Some(renderer_state);
-                }
-                Err(error) => {
-                    error!("Failed to initialize window and renderer: {}", error);
-                    event_loop.exit();
-                }
+            if let Err(e) = self.init(event_loop) {
+                eprintln!("Init failed: {}", e);
+                event_loop.exit();
             }
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            WindowEvent::Resized(new_physical_size) => {
-                if let Some(renderer) = &mut self.renderer_state {
-                    renderer.resize(new_physical_size);
-                    self.layout_engine.resize_viewport(
-                        new_physical_size.width as f32,
-                        new_physical_size.height as f32,
-                    );
+            WindowEvent::CloseRequested => event_loop.exit(),
+
+            WindowEvent::Resized(new_size) => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(new_size);
+                }
+                if let Some(layout) = &mut self.layout {
+                    layout.resize_viewport(new_size.width as f32, new_size.height as f32);
                 }
             }
+
             WindowEvent::RedrawRequested => {
-                let current_time = Instant::now();
-                let frame_delta_time = (current_time - self.last_frame_time).as_secs_f32();
-                self.last_frame_time = current_time;
+                let now = Instant::now();
+                let dt = (now - self.last_frame).as_secs_f32();
+                self.last_frame = now;
 
-                // Update layout animations
-                self.layout_engine.update(frame_delta_time);
+                if let (Some(layout), Some(renderer)) = (&mut self.layout, &mut self.renderer) {
+                    layout.update(dt);
+                    let windows = layout.get_visible_windows();
 
-                // Render the frame
-                if let Some(renderer) = &mut self.renderer_state {
-                    let visible_windows = self.layout_engine.get_visible_windows();
-                    let viewport = self.layout_engine.viewport();
-                    renderer.render_windows(&visible_windows, viewport);
+                    let renderer_windows: Vec<renderer::LayoutWindow> = windows
+                        .iter()
+                        .map(|w| renderer::LayoutWindow {
+                            x: w.x,
+                            y: w.y,
+                            width: w.width,
+                            height: w.height,
+                            texture_id: w.id % NUM_TEXTURES,
+                            is_focused: w.is_focused,
+                        })
+                        .collect();
 
-                    match renderer.present() {
+                    match renderer.render(&renderer_windows) {
                         Ok(_) => {}
                         Err(wgpu::SurfaceError::Lost) => renderer.resize(renderer.size),
                         Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                        Err(render_error) => error!("Render error: {:?}", render_error),
+                        Err(e) => eprintln!("Render error: {:?}", e),
                     }
                 }
 
-                // Request the next frame
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
+
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -136,25 +129,18 @@ impl<'window> ApplicationHandler for App<'window> {
                     },
                 ..
             } => {
-                match keycode {
-                    // Add new window to current workspace
-                    KeyCode::KeyW => {
-                        let new_window_id = self.next_window_id_counter;
-                        self.layout_engine.add_window(new_window_id);
-                        info!("Added window with ID: {}", new_window_id);
-                        self.next_window_id_counter += 1;
+                if let Some(layout) = &mut self.layout {
+                    match keycode {
+                        KeyCode::KeyW => {
+                            layout.add_window(self.next_window_id);
+                            self.next_window_id += 1;
+                        }
+                        KeyCode::KeyQ => layout.remove_focused_window(),
+                        _ => layout.handle_key(keycode),
                     }
-
-                    // Remove currently focused window
-                    KeyCode::KeyQ => {
-                        self.layout_engine.remove_focused_window();
-                        info!("Removed focused window");
-                    }
-
-                    // All other keys are handled by the layout engine
-                    _ => self.layout_engine.handle_key(keycode),
                 }
             }
+
             _ => {}
         }
     }
@@ -163,13 +149,11 @@ impl<'window> ApplicationHandler for App<'window> {
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let event_loop = EventLoop::new().context("Failed to create event loop")?;
+    let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::default();
-    event_loop
-        .run_app(&mut app)
-        .context("Event loop execution failed")?;
+    event_loop.run_app(&mut app)?;
 
     Ok(())
 }
